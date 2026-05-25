@@ -1,0 +1,227 @@
+name: 📦 دانلود APK از گوگل پلی
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'نام پکیج اپ (مثال: com.google.android.youtube)'
+        required: true
+        type: string
+      architecture:
+        description: 'معماری پردازنده'
+        required: true
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - armv7
+      merge_apk:
+        description: 'ادغام Split APK ها به یک فایل واحد؟'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  download-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: بررسی ورودی
+        run: |
+          PACKAGE="${{ github.event.inputs.package_name }}"
+          # حذف فاصله‌های اضافی
+          PACKAGE=$(echo "$PACKAGE" | tr -d ' ')
+          # بررسی فرمت پکیج
+          if ! echo "$PACKAGE" | grep -qE '^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$'; then
+            echo "❌ نام پکیج نامعتبر است: $PACKAGE"
+            echo "فرمت صحیح: com.example.app"
+            exit 1
+          fi
+          echo "✅ نام پکیج معتبر: $PACKAGE"
+
+      - name: Checkout ریپازیتوری
+        uses: actions/checkout@v4
+
+      - name: نصب Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: نصب Python و وابستگی‌ها
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apksigner wget curl
+
+      - name: دانلود و راه‌اندازی gplay-apk-downloader
+        run: |
+          git clone --depth=1 https://github.com/alltechdev/gplay-apk-downloader.git gplay-tool
+          cd gplay-tool
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install -q -r requirements.txt
+
+      - name: ساخت debug keystore برای امضای APK
+        run: |
+          cd gplay-tool
+          keytool -genkeypair \
+            -alias androiddebugkey \
+            -keypass android \
+            -keystore debug.keystore \
+            -storepass android \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -noprompt 2>/dev/null
+          echo "✅ Debug keystore ساخته شد"
+
+      - name: دانلود APK با retry خودکار
+        id: download
+        run: |
+          cd gplay-tool
+          source .venv/bin/activate
+
+          PACKAGE="${{ github.event.inputs.package_name }}"
+          PACKAGE=$(echo "$PACKAGE" | tr -d ' ')
+          ARCH="${{ github.event.inputs.architecture }}"
+          MERGE="${{ github.event.inputs.merge_apk }}"
+
+          echo "📦 پکیج: $PACKAGE"
+          echo "🏗️  معماری: $ARCH"
+          echo "🔀 ادغام: $MERGE"
+
+          # ساخت آرگومان‌های دستور
+          ARGS="download $PACKAGE -a $ARCH -o ../downloads/"
+          if [ "$MERGE" = "true" ]; then
+            ARGS="$ARGS -m"
+          fi
+
+          mkdir -p ../downloads
+
+          # اجرا با ۳ بار تلاش در صورت خطای 429
+          MAX_RETRIES=3
+          RETRY_DELAY=45
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo ""
+            echo "🔄 تلاش $i از $MAX_RETRIES ..."
+            
+            if python3 gplay-downloader.py $ARGS; then
+              echo "✅ دانلود موفق در تلاش $i"
+              echo "success=true" >> $GITHUB_OUTPUT
+              break
+            else
+              EXIT_CODE=$?
+              echo "⚠️  تلاش $i ناموفق (exit code: $EXIT_CODE)"
+              
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "⏳ ${RETRY_DELAY} ثانیه صبر می‌کنیم..."
+                sleep $RETRY_DELAY
+                RETRY_DELAY=$((RETRY_DELAY + 30))
+              else
+                echo "❌ همه تلاش‌ها ناموفق بود"
+                echo "success=false" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+            fi
+          done
+
+      - name: بررسی فایل‌های دانلود شده
+        if: steps.download.outputs.success == 'true'
+        run: |
+          echo "📁 فایل‌های دانلود شده:"
+          ls -lh downloads/ 2>/dev/null || echo "هیچ فایلی پیدا نشد"
+          
+          FILE_COUNT=$(ls downloads/ 2>/dev/null | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "❌ هیچ فایلی دانلود نشد"
+            exit 1
+          fi
+          echo "✅ تعداد فایل‌ها: $FILE_COUNT"
+
+      - name: تقسیم فایل‌های بزرگ (بیشتر از 95MB)
+        if: steps.download.outputs.success == 'true'
+        run: |
+          cd downloads
+          for FILE in *.apk *.zip; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE")
+            SIZE_MB=$((SIZE / 1024 / 1024))
+            
+            if [ $SIZE_MB -gt 95 ]; then
+              echo "✂️  فایل $FILE ($SIZE_MB MB) بزرگتر از 95MB است، تقسیم می‌شود..."
+              split -b 95m "$FILE" "${FILE}.part"
+              rm "$FILE"
+              echo "✅ تقسیم شد به:"
+              ls -lh ${FILE}.part* 2>/dev/null
+            else
+              echo "✅ فایل $FILE ($SIZE_MB MB) نیازی به تقسیم ندارد"
+            fi
+          done
+
+      - name: آپلود به ریپازیتوری
+        if: steps.download.outputs.success == 'true'
+        run: |
+          PACKAGE="${{ github.event.inputs.package_name }}"
+          PACKAGE=$(echo "$PACKAGE" | tr -d ' ')
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add downloads/
+          
+          if git diff --staged --quiet; then
+            echo "⚠️  هیچ تغییری برای commit وجود ندارد"
+          else
+            git commit -m "📦 APK دانلود شد: $PACKAGE (${{ github.event.inputs.architecture }})"
+            
+            # push با retry
+            for i in 1 2 3; do
+              git push && break
+              echo "retry push $i..."
+              sleep 5
+              git pull --rebase
+            done
+            
+            echo "✅ فایل‌ها با موفقیت به ریپازیتوری اضافه شدند"
+          fi
+
+      - name: آپلود به Artifacts (پشتیبان)
+        if: steps.download.outputs.success == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.package_name }}-${{ github.event.inputs.architecture }}
+          path: downloads/
+          retention-days: 7
+
+      - name: خلاصه نتیجه
+        if: always()
+        run: |
+          PACKAGE="${{ github.event.inputs.package_name }}"
+          echo "## 📦 نتیجه دانلود APK" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| پارامتر | مقدار |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| پکیج | \`$PACKAGE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| معماری | ${{ github.event.inputs.architecture }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ادغام APK | ${{ github.event.inputs.merge_apk }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -d "downloads" ] && [ "$(ls downloads/ 2>/dev/null | wc -l)" -gt 0 ]; then
+            echo "### ✅ دانلود موفق" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "فایل‌ها در پوشه \`downloads/\` ریپازیتوری ذخیره شدند." >> $GITHUB_STEP_SUMMARY
+            echo "همچنین در **Artifacts** این workflow قابل دانلود مستقیم هستند (7 روز)." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ دانلود ناموفق" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "احتمالاً سرویس Aurora rate-limit شده. چند دقیقه صبر کن و دوباره امتحان کن." >> $GITHUB_STEP_SUMMARY
+          fi
