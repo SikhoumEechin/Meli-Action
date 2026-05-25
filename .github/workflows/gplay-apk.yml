@@ -1,0 +1,129 @@
+name: 📦 دانلودر گوگل پلی (APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'نام پکیج اپ (مثلاً com.instagram.android)'
+        required: true
+        type: string
+      arch:
+        description: 'معماری پردازنده'
+        required: true
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - armv7
+      merge_splits:
+        description: 'ادغام split APKها به یک فایل واحد'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  download-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: ✅ بررسی نام پکیج
+        run: |
+          PACKAGE="${{ github.event.inputs.package_name }}"
+          if ! echo "$PACKAGE" | grep -qE '^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$'; then
+            echo "❌ نام پکیج نامعتبر: $PACKAGE"
+            exit 1
+          fi
+          echo "✅ نام پکیج معتبر: $PACKAGE"
+
+      - name: ☕ نصب Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 📥 کلون و نصب ابزار
+        run: |
+          git clone https://github.com/alltechdev/gplay-apk-downloader.git
+          cd gplay-apk-downloader
+          pip3 install -r requirements.txt --quiet
+          mkdir -p ../output
+
+      - name: 📦 احراز هویت + دانلود APK (با retry)
+        run: |
+          cd gplay-apk-downloader
+
+          PACKAGE="${{ github.event.inputs.package_name }}"
+          ARCH="${{ github.event.inputs.arch }}"
+          MERGE="${{ github.event.inputs.merge_splits }}"
+
+          MERGE_FLAG=""
+          if [ "$MERGE" = "true" ]; then
+            MERGE_FLAG="--merge"
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            echo ""
+            echo "====== تلاش $attempt از 5 ======"
+
+            echo "🔑 گرفتن توکن..."
+            python3 gplay-downloader.py auth --arch "$ARCH"
+            AUTH_CODE=$?
+
+            if [ $AUTH_CODE -ne 0 ]; then
+              echo "⚠️ auth ناموفق (exit: $AUTH_CODE)"
+            else
+              echo "✅ توکن گرفته شد، شروع دانلود..."
+              python3 gplay-downloader.py download "$PACKAGE" \
+                --arch "$ARCH" \
+                --output ../output \
+                $MERGE_FLAG
+              DL_CODE=$?
+
+              if [ $DL_CODE -eq 0 ]; then
+                echo "✅ دانلود موفق!"
+                exit 0
+              else
+                echo "⚠️ دانلود ناموفق (exit: $DL_CODE)"
+              fi
+            fi
+
+            if [ $attempt -lt 5 ]; then
+              WAIT=$((attempt * 45))
+              echo "⏳ $WAIT ثانیه صبر می‌کنیم..."
+              sleep $WAIT
+              # پاک کردن توکن قدیمی برای تلاش بعدی
+              rm -f ~/.gplay-auth.json
+            fi
+          done
+
+          echo "❌ همه تلاش‌ها ناموفق بود"
+          exit 1
+
+      - name: 📊 نمایش اطلاعات فایل
+        if: success()
+        run: |
+          APK=$(find output/ -name "*.apk" -o -name "*.zip" | head -1)
+          if [ -n "$APK" ]; then
+            echo "✅ فایل آماده: $(basename $APK) — $(du -sh $APK | cut -f1)"
+          fi
+
+      - name: ☁️ آپلود به Artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ github.event.inputs.package_name }}_${{ github.event.inputs.arch }}"
+          path: output/
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: ❌ گزارش خطا
+        if: failure()
+        run: |
+          echo "======================================"
+          echo "❌ دانلود ناموفق"
+          echo "======================================"
+          echo "• خطای 429: Aurora rate-limit — چند دقیقه صبر کن و دوباره run کن"
+          echo "• اپ پولی است"
+          echo "• نام پکیج اشتباه است"
+          echo "پکیج: ${{ github.event.inputs.package_name }}"
